@@ -11,3 +11,8 @@ eval_bundle/
 # Local setup
 CLAUDE.md
 wandb/
+
+# #####
+# self-distillation work: NANOCHAT_BASE_DIR target for in-repo run artifacts
+run_artifacts/
+# ######
