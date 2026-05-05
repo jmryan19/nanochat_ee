@@ -384,6 +384,71 @@ class RustBPETokenizer:
         ids.append(assistant_start)
         return ids
 
+    # #####
+    def render_for_base_completion(self, conversation, *, separator="\n", few_shot_examples=None):
+        """
+        Render a conversation for BASE-model (pretrained-only) completion-style evaluation.
+
+        Bypasses every chat special token (<|user_start|>, <|assistant_start|>, etc.) since
+        the base model has not been trained on those as conversation delimiters; only
+        <|bos|> is emitted, matching the document boundary convention from pretraining.
+
+        Behavior:
+          1. Deep-copy `conversation` and pop the trailing assistant message if present
+             (matching render_for_completion).
+          2. If the first message is `system`, merge it into the next user message with a
+             "\\n\\n" separator (matching render_conversation).
+          3. Concatenate remaining user message contents with `separator`, prepend <|bos|>,
+             optionally insert few-shot examples before the prompt, and append `separator`
+             at the end so the model is primed to continue.
+
+        Args:
+            conversation: {"messages": [{"role": ..., "content": str}, ...]}.
+            separator: text inserted between the prompt and the model's continuation point
+                       (default "\\n"). For MC tasks, "\\nAnswer: " or " " may bind better.
+            few_shot_examples: optional list of {"prompt": str, "answer": str} dicts; each is
+                               rendered as `prompt + separator + answer + "\\n\\n"` before the
+                               test prompt. None (default) means zero-shot.
+
+        Returns:
+            ids: list[int].
+        """
+        conversation = copy.deepcopy(conversation)
+        messages = conversation["messages"]
+
+        # 1) Pop the trailing assistant reference answer (we generate; we don't need it here).
+        if len(messages) > 0 and messages[-1]["role"] == "assistant":
+            messages.pop()
+
+        # 2) Merge a leading system message into the next user message (mirrors render_conversation).
+        if len(messages) > 0 and messages[0]["role"] == "system":
+            assert len(messages) >= 2 and messages[1]["role"] == "user", \
+                "System message must be followed by a user message"
+            messages[1]["content"] = messages[0]["content"] + "\n\n" + messages[1]["content"]
+            messages = messages[1:]
+
+        # 3) Concatenate remaining user contents. We don't expect tool-call parts in base eval prompts.
+        user_texts = []
+        for m in messages:
+            assert m["role"] == "user", (
+                f"Expected user message after popping trailing assistant, got {m['role']!r}. "
+                "Base completion does not support multi-turn assistant dialogue."
+            )
+            content = m["content"]
+            assert isinstance(content, str), \
+                "User messages must be plain strings for base completion (no tool-call parts)."
+            user_texts.append(content)
+        prompt = separator.join(user_texts)
+
+        # Build the token stream: <|bos|>, optional few-shot prefix, then prompt + separator.
+        ids = [self.get_bos_token_id()]
+        if few_shot_examples is not None:
+            for ex in few_shot_examples:
+                ids.extend(self.encode(ex["prompt"] + separator + ex["answer"] + "\n\n"))
+        ids.extend(self.encode(prompt + separator))
+        return ids
+    # ######
+
 # -----------------------------------------------------------------------------
 # nanochat-specific convenience functions
 

@@ -37,10 +37,59 @@ class GPTConfig:
     # Characters: L=long (full context), S=short (quarter context)
     # Examples: "L"=all full context, "SL"=alternating, "SSL"=two short then one long
     window_pattern: str = "SSSL"
+    # #####
+    # Self-distillation: project an early layer's hidden state through the same lm_head
+    # as the final layer, then add an auxiliary KL loss against the (stop-grad) teacher.
+    # distill_layer: 0-indexed layer whose POST-block output becomes the student
+    #                (-1 disables; valid range when enabled is [0, n_layer-1]).
+    # distill_weight: scalar coefficient on the aux loss (0.0 disables).
+    # distill_kl_direction: 'forward' = KL(teacher || student), top-k indices from teacher.
+    #                       'reverse' = KL(student || teacher), top-k indices from student.
+    # distill_top_k_logits: None disables top-k (use full vocab).
+    #                       int N restricts the divergence to N indices selected per the rule
+    #                       above, with log-probs gathered from the FULL-vocab log_softmax
+    #                       (no renormalization over the top-k subset).
+    distill_layer: int = -1
+    distill_weight: float = 0.0
+    distill_kl_direction: str = 'forward'
+    distill_top_k_logits: int | None = None
+    # ######
 
 
 def norm(x):
     return F.rms_norm(x, (x.size(-1),)) # note that this will run in bf16, seems ok
+
+# #####
+def distill_kl_loss(student_logits, teacher_logits, valid_mask, direction='forward', top_k=None):
+    """
+    Self-distillation KL loss with optional top-k truncation.
+
+    student_logits, teacher_logits: (N, V) float — softcapped logits. Caller is responsible
+        for .detach()'ing the teacher (gradients should flow only through the student).
+    valid_mask: (N,) bool — positions to include (e.g. targets != ignore_index).
+    direction: 'forward' -> KL(teacher || student); top-k indices selected from teacher.
+               'reverse' -> KL(student || teacher); top-k indices selected from student.
+    top_k: None or int. If int, log-probs are computed from log_softmax over the FULL vocab
+        and then gathered at the top-k indices (no renormalization over the subset). This
+        keeps gradient signal alive on non-top-k vocab positions via the log-sum-exp
+        denominator.
+    Returns scalar mean KL over valid positions.
+    """
+    student_logits = student_logits[valid_mask]
+    teacher_logits = teacher_logits[valid_mask]
+    student_lp = F.log_softmax(student_logits, dim=-1)
+    teacher_lp = F.log_softmax(teacher_logits, dim=-1)
+    if top_k is not None:
+        src = teacher_logits if direction == 'forward' else student_logits
+        _, idx = torch.topk(src.detach(), k=top_k, dim=-1)
+        student_lp = torch.gather(student_lp, -1, idx)
+        teacher_lp = torch.gather(teacher_lp, -1, idx)
+    if direction == 'forward':
+        kl_sum = F.kl_div(student_lp, teacher_lp, reduction='sum', log_target=True)
+    else:
+        kl_sum = F.kl_div(teacher_lp, student_lp, reduction='sum', log_target=True)
+    return kl_sum / valid_mask.sum().clamp_min(1)
+# ######
 
 class Linear(nn.Linear):
     """nn.Linear that casts weights to match input dtype in forward.
@@ -160,6 +209,14 @@ class GPT(nn.Module):
         """
         super().__init__()
         self.config = config
+        # #####
+        # Self-distillation: validate the new knobs once at construction.
+        assert config.distill_kl_direction in ('forward', 'reverse'), \
+            f"distill_kl_direction must be 'forward' or 'reverse', got {config.distill_kl_direction!r}"
+        if config.distill_top_k_logits is not None:
+            assert 1 <= config.distill_top_k_logits <= config.vocab_size, \
+                f"distill_top_k_logits must be in [1, vocab_size={config.vocab_size}], got {config.distill_top_k_logits}"
+        # ######
         # Compute per-layer window sizes for sliding window attention
         # window_size is (left, right) tuple: (-1, 0) for full context, (N, 0) for sliding window
         self.window_sizes = self._compute_window_sizes(config)
@@ -453,16 +510,37 @@ class GPT(nn.Module):
         n_layer = self.config.n_layer
         backout_layer = n_layer // 2  # cache at halfway point
         x_backout = None
+        # #####
+        # Self-distillation: capture the post-block output of `distill_layer` for the
+        # auxiliary KL loss. None when distillation is disabled (distill_layer < 0).
+        x_early = None
+        # ######
         for i, block in enumerate(self.transformer.h):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             ve = self.value_embeds[str(i)](idx).to(x.dtype) if str(i) in self.value_embeds else None
             x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
             if i == backout_layer:
                 x_backout = x
+            # #####
+            # Self-distillation: snapshot the chosen early-layer's output. No clone is needed
+            # because the next iteration rebinds `x` to a new tensor (no in-place mutation),
+            # so this reference remains valid through the rest of the forward pass.
+            if i == self.config.distill_layer:
+                x_early = x
+            # ######
         # Subtract mid-layer residual to remove low-level features before logit projection
         if x_backout is not None:
             x = x - self.backout_lambda.to(x.dtype) * x_backout
         x = norm(x)
+
+        # #####
+        # Self-distillation: if x_early was captured at or after the backout layer, mirror the
+        # backout subtraction so the student sees the same representational footing as the
+        # teacher (which has x_backout removed). For distill_layer < backout_layer the early
+        # state predates the snapshot, so no mirroring is needed.
+        if x_early is not None and x_backout is not None and self.config.distill_layer >= backout_layer:
+            x_early = x_early - self.backout_lambda.to(x_early.dtype) * x_backout
+        # ######
 
         # Forward the lm_head (compute logits)
         softcap = 15 # smoothly cap the logits to the range [-softcap, softcap]
@@ -471,10 +549,45 @@ class GPT(nn.Module):
         logits = logits.float() # switch to fp32 for logit softcap and loss computation
         logits = softcap * torch.tanh(logits / softcap) # squash the logits
 
+        # #####
+        # Self-distillation: project x_early through the SAME stack used for the final logits
+        # (norm -> lm_head -> slice -> float -> softcap), so teacher and student live on the
+        # same value scale. Only computed when the aux loss will actually be added (skips the
+        # BPB-eval path which uses loss_reduction='none', and also skips when distillation is
+        # disabled). lm_head is reused (weight-tied via the model's tied weights, no new params).
+        logits_early = None
+        if (x_early is not None
+                and targets is not None
+                and self.config.distill_weight > 0.0
+                and loss_reduction == 'mean'):
+            x_early = norm(x_early)
+            logits_early = self.lm_head(x_early)
+            logits_early = logits_early[..., :self.config.vocab_size]
+            logits_early = logits_early.float()
+            logits_early = softcap * torch.tanh(logits_early / softcap)
+        # ######
+
         if targets is not None:
             # training: given the targets, compute and return the loss
             # TODO experiment with chunked cross-entropy?
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
+            # #####
+            # Self-distillation: aux KL over valid (non-pad) positions, with optional
+            # direction (forward/reverse) and optional top-k truncation. Teacher is .detach()'d
+            # so the aux gradient flows only through the early layers and the lm_head's student
+            # call; the final layers are trained by the main CE loss alone.
+            if logits_early is not None:
+                valid = (targets.view(-1) != -1)
+                V = logits.size(-1)
+                loss_aux = distill_kl_loss(
+                    student_logits=logits_early.view(-1, V),
+                    teacher_logits=logits.view(-1, V).detach(),
+                    valid_mask=valid,
+                    direction=self.config.distill_kl_direction,
+                    top_k=self.config.distill_top_k_logits,
+                )
+                loss = loss + self.config.distill_weight * loss_aux
+            # ######
             return loss
         else:
             # inference: just return the logits directly

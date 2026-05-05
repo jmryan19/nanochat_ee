@@ -77,6 +77,12 @@ parser.add_argument("--sample-every", type=int, default=2000, help="sample from 
 parser.add_argument("--save-every", type=int, default=-1, help="save checkpoints every N steps (-1 = only at end)")
 # Output
 parser.add_argument("--model-tag", type=str, default=None, help="override model tag for checkpoint directory name")
+# #####
+# Self-distillation flags. Defaults preserve no-distill behavior (the GPTConfig defaults
+# already disable distillation, so unset flags = identical baseline run).
+parser.add_argument("--distill-layer", type=int, default=-1, help="0-indexed layer whose output is the early student for KL self-distillation (-1 = disabled)")
+parser.add_argument("--distill-weight", type=float, default=0.0, help="coefficient on the KL self-distillation aux loss (0.0 = disabled)")
+# ######
 args = parser.parse_args()
 user_config = vars(args).copy()  # for logging
 # -----------------------------------------------------------------------------
@@ -137,6 +143,11 @@ def build_model_meta(depth):
         sequence_len=args.max_seq_len, vocab_size=vocab_size,
         n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
         window_pattern=args.window_pattern,
+        # #####
+        # Self-distillation knobs (defaults at -1 / 0.0 keep distillation off).
+        distill_layer=args.distill_layer,
+        distill_weight=args.distill_weight,
+        # ######
     )
     with torch.device("meta"):
         model_meta = GPT(config)
