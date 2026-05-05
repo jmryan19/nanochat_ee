@@ -1,3 +1,4 @@
+.venv
 .venv/
 __pycache__/
 *.pyc
@@ -15,4 +16,6 @@ wandb/
 # #####
 # self-distillation work: NANOCHAT_BASE_DIR target for in-repo run artifacts
 run_artifacts/
+# SLURM output captured via sbatch --output=runs/*.log
+runs/*.log
 # ######
