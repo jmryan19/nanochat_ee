@@ -39,17 +39,57 @@ class GPTConfig:
     window_pattern: str = "SSSL"
     # #####
     # Self-distillation: project an early layer's hidden state through the same lm_head
-    # as the final layer, then add a KL(student || stop_grad(teacher)) auxiliary loss.
+    # as the final layer, then add an auxiliary KL loss against the (stop-grad) teacher.
     # distill_layer: 0-indexed layer whose POST-block output becomes the student
     #                (-1 disables; valid range when enabled is [0, n_layer-1]).
     # distill_weight: scalar coefficient on the aux loss (0.0 disables).
+    # distill_kl_direction: 'forward' = KL(teacher || student), top-k indices from teacher.
+    #                       'reverse' = KL(student || teacher), top-k indices from student.
+    # distill_top_k_logits: None disables top-k (use full vocab).
+    #                       int N restricts the divergence to N indices selected per the rule
+    #                       above, with log-probs gathered from the FULL-vocab log_softmax
+    #                       (no renormalization over the top-k subset).
     distill_layer: int = -1
     distill_weight: float = 0.0
+    distill_kl_direction: str = 'forward'
+    distill_top_k_logits: int | None = None
     # ######
 
 
 def norm(x):
     return F.rms_norm(x, (x.size(-1),)) # note that this will run in bf16, seems ok
+
+# #####
+def distill_kl_loss(student_logits, teacher_logits, valid_mask, direction='forward', top_k=None):
+    """
+    Self-distillation KL loss with optional top-k truncation.
+
+    student_logits, teacher_logits: (N, V) float — softcapped logits. Caller is responsible
+        for .detach()'ing the teacher (gradients should flow only through the student).
+    valid_mask: (N,) bool — positions to include (e.g. targets != ignore_index).
+    direction: 'forward' -> KL(teacher || student); top-k indices selected from teacher.
+               'reverse' -> KL(student || teacher); top-k indices selected from student.
+    top_k: None or int. If int, log-probs are computed from log_softmax over the FULL vocab
+        and then gathered at the top-k indices (no renormalization over the subset). This
+        keeps gradient signal alive on non-top-k vocab positions via the log-sum-exp
+        denominator.
+    Returns scalar mean KL over valid positions.
+    """
+    student_logits = student_logits[valid_mask]
+    teacher_logits = teacher_logits[valid_mask]
+    student_lp = F.log_softmax(student_logits, dim=-1)
+    teacher_lp = F.log_softmax(teacher_logits, dim=-1)
+    if top_k is not None:
+        src = teacher_logits if direction == 'forward' else student_logits
+        _, idx = torch.topk(src.detach(), k=top_k, dim=-1)
+        student_lp = torch.gather(student_lp, -1, idx)
+        teacher_lp = torch.gather(teacher_lp, -1, idx)
+    if direction == 'forward':
+        kl_sum = F.kl_div(student_lp, teacher_lp, reduction='sum', log_target=True)
+    else:
+        kl_sum = F.kl_div(teacher_lp, student_lp, reduction='sum', log_target=True)
+    return kl_sum / valid_mask.sum().clamp_min(1)
+# ######
 
 class Linear(nn.Linear):
     """nn.Linear that casts weights to match input dtype in forward.
@@ -169,6 +209,14 @@ class GPT(nn.Module):
         """
         super().__init__()
         self.config = config
+        # #####
+        # Self-distillation: validate the new knobs once at construction.
+        assert config.distill_kl_direction in ('forward', 'reverse'), \
+            f"distill_kl_direction must be 'forward' or 'reverse', got {config.distill_kl_direction!r}"
+        if config.distill_top_k_logits is not None:
+            assert 1 <= config.distill_top_k_logits <= config.vocab_size, \
+                f"distill_top_k_logits must be in [1, vocab_size={config.vocab_size}], got {config.distill_top_k_logits}"
+        # ######
         # Compute per-layer window sizes for sliding window attention
         # window_size is (left, right) tuple: (-1, 0) for full context, (N, 0) for sliding window
         self.window_sizes = self._compute_window_sizes(config)
@@ -524,16 +572,20 @@ class GPT(nn.Module):
             # TODO experiment with chunked cross-entropy?
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
             # #####
-            # Self-distillation: KL(student || stop_grad(teacher)) over valid (non-pad) positions.
-            # Teacher is .detach()'d so the aux gradient flows only through the early layers and
-            # the lm_head's student call; the final layers are trained by the main CE loss alone.
-            # 'batchmean' divides by number of valid positions (matches CE 'mean' over the same mask).
+            # Self-distillation: aux KL over valid (non-pad) positions, with optional
+            # direction (forward/reverse) and optional top-k truncation. Teacher is .detach()'d
+            # so the aux gradient flows only through the early layers and the lm_head's student
+            # call; the final layers are trained by the main CE loss alone.
             if logits_early is not None:
                 valid = (targets.view(-1) != -1)
                 V = logits.size(-1)
-                teacher = F.log_softmax(logits.view(-1, V).detach()[valid], dim=-1)
-                student = F.log_softmax(logits_early.view(-1, V)[valid], dim=-1)
-                loss_aux = F.kl_div(student, teacher, reduction='batchmean', log_target=True)
+                loss_aux = distill_kl_loss(
+                    student_logits=logits_early.view(-1, V),
+                    teacher_logits=logits.view(-1, V).detach(),
+                    valid_mask=valid,
+                    direction=self.config.distill_kl_direction,
+                    top_k=self.config.distill_top_k_logits,
+                )
                 loss = loss + self.config.distill_weight * loss_aux
             # ######
             return loss
