@@ -82,6 +82,11 @@ parser.add_argument("--model-tag", type=str, default=None, help="override model 
 # already disable distillation, so unset flags = identical baseline run).
 parser.add_argument("--distill-layer", type=int, default=-1, help="0-indexed layer whose output is the early student for KL self-distillation (-1 = disabled)")
 parser.add_argument("--distill-weight", type=float, default=0.0, help="coefficient on the KL self-distillation aux loss (0.0 = disabled)")
+parser.add_argument("--distill-kl-direction", type=str, default="forward", choices=["forward", "reverse"],
+                    help="KL direction. forward = KL(teacher || student); reverse = KL(student || teacher).")
+parser.add_argument("--distill-top-k-logits", type=int, default=-1,
+                    help="Top-k logit truncation for the aux KL (-1 = full vocab; >0 = restrict divergence to that "
+                         "many indices, selected from teacher in forward mode and student in reverse mode).")
 # ######
 args = parser.parse_args()
 user_config = vars(args).copy()  # for logging
@@ -147,6 +152,10 @@ def build_model_meta(depth):
         # Self-distillation knobs (defaults at -1 / 0.0 keep distillation off).
         distill_layer=args.distill_layer,
         distill_weight=args.distill_weight,
+        distill_kl_direction=args.distill_kl_direction,
+        # int=-1 -> None mapping: keeps argparse simple while preserving the None semantic
+        # that distill_kl_loss expects when top-k truncation is disabled.
+        distill_top_k_logits=(None if args.distill_top_k_logits < 0 else args.distill_top_k_logits),
         # ######
     )
     with torch.device("meta"):

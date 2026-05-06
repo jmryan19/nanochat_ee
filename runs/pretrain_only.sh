@@ -12,6 +12,8 @@
 #
 # Self-distillation flags (default off; populated in stage 1+):
 #   DISTILL_LAYER=4 DISTILL_WEIGHT=0.1 bash runs/pretrain_only.sh
+#   DISTILL_LAYER=11 DISTILL_WEIGHT=0.1 DISTILL_KL_DIRECTION=reverse \
+#       DISTILL_TOP_K=100 bash runs/pretrain_only.sh
 
 export OMP_NUM_THREADS=1
 
@@ -48,6 +50,21 @@ if [ "$DISTILL_LAYER" -ge 0 ] 2>/dev/null && [ "$(echo "$DISTILL_WEIGHT > 0" | b
 else
     echo "Self-distillation disabled (DISTILL_LAYER=$DISTILL_LAYER, DISTILL_WEIGHT=$DISTILL_WEIGHT)"
 fi
+
+# #####
+# Stage 5.1: forward direction + top-k env vars. These are appended to DISTILL_ARGS only
+# when overridden away from their no-op defaults, so an unset env preserves the legacy
+# distill behavior bit-for-bit.
+DISTILL_KL_DIRECTION="${DISTILL_KL_DIRECTION:-forward}"
+DISTILL_TOP_K="${DISTILL_TOP_K:--1}"
+if [ "$DISTILL_KL_DIRECTION" != "forward" ]; then
+    DISTILL_ARGS="$DISTILL_ARGS --distill-kl-direction=$DISTILL_KL_DIRECTION"
+fi
+if [ "$DISTILL_TOP_K" -ge 0 ] 2>/dev/null; then
+    DISTILL_ARGS="$DISTILL_ARGS --distill-top-k-logits=$DISTILL_TOP_K"
+fi
+[ -n "$DISTILL_ARGS" ] && echo "Final DISTILL_ARGS: $DISTILL_ARGS"
+# ######
 
 # -----------------------------------------------------------------------------
 # Reset the markdown report (writes a header with system info + start timestamp).
