@@ -68,6 +68,18 @@ parser.add_argument("--warmup-steps", type=int, default=40, help="number of step
 parser.add_argument("--warmdown-ratio", type=float, default=0.65, help="ratio of iterations for LR warmdown")
 parser.add_argument("--final-lr-frac", type=float, default=0.05, help="final LR as fraction of initial LR")
 parser.add_argument("--resume-from-step", type=int, default=-1, help="resume training from this step (-1 = disable)")
+# #####
+# Stage 5.2: chunked-run support. --resume-from-latest auto-detects the highest
+# saved step in the checkpoint dir; --keep-last prunes older checkpoints after each save
+# (-1 = keep all, matches legacy behavior).
+parser.add_argument("--resume-from-latest", action="store_true",
+                    help="If set, scan the checkpoint dir for the highest model_*.pt step and resume from it. "
+                         "Overrides --resume-from-step. Use this in chunked SLURM jobs.")
+parser.add_argument("--keep-last", type=int, default=-1,
+                    help="After each periodic save, prune older checkpoints so only the last K remain "
+                         "(-1 = keep all). Affects model_*.pt, meta_*.json, optim_*_rank*.pt for steps "
+                         "OLDER than the K most recent.")
+# ######
 # Evaluation
 parser.add_argument("--eval-every", type=int, default=250, help="evaluate val bpb every N steps (-1 = disable)")
 parser.add_argument("--eval-tokens", type=int, default=80*524288, help="number of tokens to evaluate val loss on")
@@ -174,6 +186,24 @@ model.init_weights() # 3) All tensors get initialized
 base_dir = get_base_dir()
 output_dirname = args.model_tag if args.model_tag else f"d{args.depth}" # e.g. d12
 checkpoint_dir = os.path.join(base_dir, "base_checkpoints", output_dirname)
+# #####
+# Stage 5.2: --resume-from-latest auto-detects the highest saved step in the checkpoint
+# dir. Overrides --resume-from-step. If no checkpoints exist yet, falls through to a
+# fresh-start run -- this is the chunked-job-friendly default (first job starts fresh,
+# subsequent jobs in the chain pick up where the prior one left off).
+if args.resume_from_latest:
+    from nanochat.checkpoint_manager import find_last_step
+    if os.path.isdir(checkpoint_dir):
+        try:
+            args.resume_from_step = find_last_step(checkpoint_dir)
+            print0(f"--resume-from-latest: found step {args.resume_from_step} in {checkpoint_dir}")
+        except FileNotFoundError:
+            print0(f"--resume-from-latest: no checkpoints in {checkpoint_dir}, starting from scratch")
+            args.resume_from_step = -1
+    else:
+        print0(f"--resume-from-latest: {checkpoint_dir} does not exist, starting from scratch")
+        args.resume_from_step = -1
+# ######
 resuming = args.resume_from_step != -1
 if resuming:
     print0(f"Resuming optimization from step {args.resume_from_step}")
@@ -517,6 +547,37 @@ while True:
             },
             rank=ddp_rank,
         )
+        # #####
+        # Stage 5.2: prune older checkpoints so only the K most recent remain. No-op when
+        # --keep-last=-1 (default) or fewer than K checkpoints exist. Rank-0 only since the
+        # save_checkpoint convention puts model+meta only on rank 0; per-rank optim shards
+        # are deleted alongside via the per-old-step glob.
+        if master_process and args.keep_last > 0:
+            import glob
+            model_files = sorted(glob.glob(os.path.join(checkpoint_dir, "model_*.pt")))
+            if len(model_files) > args.keep_last:
+                for old in model_files[:-args.keep_last]:
+                    old_step = int(os.path.basename(old).split("_")[-1].split(".")[0])
+                    for path in [
+                        os.path.join(checkpoint_dir, f"model_{old_step:06d}.pt"),
+                        os.path.join(checkpoint_dir, f"meta_{old_step:06d}.json"),
+                    ]:
+                        if os.path.exists(path):
+                            os.remove(path)
+                    for opt in glob.glob(os.path.join(checkpoint_dir, f"optim_{old_step:06d}_rank*.pt")):
+                        os.remove(opt)
+                kept_first = int(os.path.basename(model_files[-args.keep_last]).split("_")[-1].split(".")[0])
+                print0(f"Pruned checkpoints older than step {kept_first}; kept last {args.keep_last}.")
+        # ######
+        # #####
+        # Stage 5.2: write a done.flag marker at the final step so chunked SLURM wrappers
+        # have a single, robust completion signal that doesn't require recomputing
+        # num_iterations in bash. Rank-0 only (avoids races).
+        if last_step and master_process:
+            done_path = os.path.join(checkpoint_dir, "done.flag")
+            open(done_path, "w").close()
+            print0(f"Wrote completion marker: {done_path}")
+        # ######
 
     # termination conditions (TODO: possibly also add loss explosions etc.)
     if last_step:
